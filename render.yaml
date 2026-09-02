@@ -10,6 +10,8 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false     # 在 Render 后台手填，绝不进仓库
+      - key: ANTHROPIC_WORKSPACE_ID
+        sync: false     # 只有跨 workspace 的 key 才需要；绑定单一 workspace 的留空
       - key: MODEL
         value: claude-sonnet-5
       - key: NODE_VERSION
