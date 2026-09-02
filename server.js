@@ -36,7 +36,16 @@ setInterval(() => {
   for (const [ip, b] of buckets) if (b.last < cutoff) buckets.delete(ip);
 }, 1000 * 60 * 10).unref();
 
-const anthropic = new Anthropic({ apiKey: (process.env.ANTHROPIC_API_KEY || "").trim() });
+const WORKSPACE_ID = (process.env.ANTHROPIC_WORKSPACE_ID || "").trim();
+
+const anthropic = new Anthropic({
+  apiKey: (process.env.ANTHROPIC_API_KEY || "").trim(),
+  // 个人 key / 服务账号 key 可跨多个 workspace，这类 key 每次请求都要声明
+  // 本次请求算在哪个 workspace 名下。绑定到单一 workspace 的 key 不需要。
+  ...(WORKSPACE_ID
+    ? { defaultHeaders: { "anthropic-workspace-id": WORKSPACE_ID } }
+    : {})
+});
 const MODEL = process.env.MODEL || "claude-sonnet-5";
 
 {
@@ -47,6 +56,12 @@ const MODEL = process.env.MODEL || "claude-sonnet-5";
     if (k !== k.trim()) console.warn("⚠ ANTHROPIC_API_KEY 首尾有空白字符，已自动 trim。");
     if (/^["']|["']$/.test(k)) console.warn("⚠ ANTHROPIC_API_KEY 被引号包住了，去掉引号。");
     console.log(`✓ key 已加载（长度 ${k.length}），模型 ${MODEL}`);
+  }
+  if (WORKSPACE_ID) {
+    console.log(`✓ workspace: ${WORKSPACE_ID}`);
+    if (!WORKSPACE_ID.startsWith("wrkspc_")) {
+      console.warn("⚠ workspace id 通常是 wrkspc_ 开头，确认一下没填错。");
+    }
   }
 }
 
@@ -61,6 +76,22 @@ setInterval(() => {
 }, 1000 * 60 * 10).unref();
 
 const VERDICTS = ["是", "否", "无关", "换个问法"];
+
+// 模型很可能用自然的中文写法作答（「不是」而不是「否」）。
+// 与其在 prompt 里加更多约束，不如在解析层容忍。
+const VERDICT_ALIASES = new Map(Object.entries({
+  "是": "是", "是的": "是", "对": "对是", "正确": "是", "yes": "是",
+  "否": "否", "不是": "否", "不对": "否", "错误": "否", "no": "否",
+  "无关": "无关", "无关紧要": "无关", "不重要": "无关", "与此无关": "无关",
+  "不相关": "无关", "irrelevant": "无关", "moot": "无关",
+  "换个问法": "换个问法", "请换个问法": "换个问法", "无法回答": "换个问法",
+  "不能回答": "换个问法", "rephrase": "换个问法"
+}).map(([k, v]) => [k, v === "对是" ? "是" : v]));
+
+function normalizeVerdict(raw) {
+  const v = String(raw ?? "").trim().replace(/[。．.!！]$/, "");
+  return VERDICT_ALIASES.get(v) || VERDICT_ALIASES.get(v.toLowerCase()) || null;
+}
 
 function systemPrompt(puzzle, hit) {
   return `你是海龟汤的主持人。玩家只看到了【汤面】。你掌握【汤底】【事实】【关键点】。
@@ -126,7 +157,8 @@ function parseVerdict(raw, puzzle, hit) {
   if (open === -1 || close === -1) throw new Error("no json object");
 
   const o = JSON.parse(text.slice(open, close + 1));
-  if (!VERDICTS.includes(o.verdict)) throw new Error("bad verdict: " + o.verdict);
+  const verdict = normalizeVerdict(o.verdict);
+  if (!verdict) throw new Error("bad verdict: " + JSON.stringify(o.verdict));
 
   const valid = new Set(puzzle.keys.map((k) => k.id));
   const hitSet = new Set(hit);
@@ -134,13 +166,23 @@ function parseVerdict(raw, puzzle, hit) {
     .filter((k) => valid.has(k) && !hitSet.has(k));
 
   return {
-    verdict: o.verdict,
+    verdict,
     keys: fresh,
-    solved: o.solved === true,
+    solved: o.solved === true || o.solved === "true",
     // note 只在换个问法时保留，且截断，避免任何形式的内容泄漏
-    note: o.verdict === "换个问法" ? String(o.note || "").slice(0, 60) : ""
+    note: verdict === "换个问法" ? String(o.note || "").slice(0, 60) : ""
   };
 }
+
+// Sonnet 5 起的模型不再接受 temperature / top_p / top_k，设了就 400。
+// 所以默认完全不发采样参数；只有显式设了 TEMPERATURE 环境变量才带上
+// （给需要回退到老模型的情况留的口子）。
+// 万一带上了又被拒，下面会自动剥掉重试一次，这样换模型永远不会因为
+// 这个参数再挂一次。
+const TEMPERATURE = process.env.TEMPERATURE ? Number(process.env.TEMPERATURE) : null;
+const rejectsSampling = (err) =>
+  err?.status === 400 &&
+  /temperature|top_p|top_k/i.test(err?.error?.error?.message ?? err?.message ?? "");
 
 async function adjudicate(puzzle, session, question) {
   const messages = [
@@ -151,12 +193,14 @@ async function adjudicate(puzzle, session, question) {
     { role: "user", content: question }
   ];
 
+  let sendTemp = TEMPERATURE !== null;
+
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await anthropic.messages.create({
         model: MODEL,
         max_tokens: 300,
-        temperature: 0.15,
+        ...(sendTemp ? { temperature: TEMPERATURE } : {}),
         system: systemPrompt(puzzle, session.hit),
         messages
       });
@@ -164,15 +208,32 @@ async function adjudicate(puzzle, session, question) {
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("");
-      return parseVerdict(text, puzzle, session.hit);
+      if (process.env.DEBUG_RAW) console.log("[raw]", JSON.stringify(text));
+      try {
+        return parseVerdict(text, puzzle, session.hit);
+      } catch (parseErr) {
+        // 解析失败和 API 失败是两种完全不同的病，日志里必须分得清
+        console.error(
+          "[adjudicate] PARSE failed:", parseErr.message,
+          "\n  模型原样输出:", JSON.stringify(text.slice(0, 400))
+        );
+        throw parseErr;
+      }
     } catch (err) {
-      // 打全，否则线上只能看到「无关」，看不到真正的原因
-      console.error(
-        `[adjudicate] attempt ${attempt + 1} failed`,
-        "status=", err.status ?? "-",
-        "type=", err.error?.error?.type ?? err.name,
-        "msg=", err.error?.error?.message ?? err.message
-      );
+      if (rejectsSampling(err) && sendTemp) {
+        console.warn(`⚠ 模型 ${MODEL} 不接受 temperature，已剥掉重试。可以移除 TEMPERATURE 环境变量。`);
+        sendTemp = false;
+        attempt--;              // 这次不算重试次数，参数问题不是模型的错
+        continue;
+      }
+      if (err.status || err.name === "APIError" || !err.message.startsWith("bad verdict")) {
+        console.error(
+          `[adjudicate] attempt ${attempt + 1} failed`,
+          "status=", err.status ?? "-",
+          "type=", err.error?.error?.type ?? err.name,
+          "msg=", err.error?.error?.message ?? err.message
+        );
+      }
     }
   }
   // 降级：误判一次「无关」代价很小，崩一次代价是整局。
