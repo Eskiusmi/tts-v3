@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: haigui-soup
+    runtime: node
+    plan: free          # 改成 starter 可消除休眠和冷启动
+    region: oregon
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false     # 在 Render 后台手填，绝不进仓库
+      - key: MODEL
+        value: claude-sonnet-5
+      - key: NODE_VERSION
+        value: "20"
